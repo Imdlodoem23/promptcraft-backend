@@ -82,11 +82,14 @@ function takePlan(token) {
 }
 
 // ---- image generation (returns a PNG Buffer or null) ----
-async function generateImage(prompt) {
+async function generateImage(prompt, small) {
   const p = "Isometric low-poly Roblox-style 3D render, 3/4 top-down view, clean solid colors, no text: " + prompt;
   if (IMAGE_PROVIDER === "openai") {
     if (!imageClientOpenAI) return null;
-    const r = await imageClientOpenAI.images.generate({ model: IMAGE_MODEL, prompt: p, size: "1024x1024", n: 1 });
+    const r = await imageClientOpenAI.images.generate({
+      model: IMAGE_MODEL, prompt: p, size: "1024x1024", n: 1,
+      ...(small && IMAGE_MODEL.startsWith("gpt-image") ? { quality: "low" } : {}),
+    });
     const b64 = r.data?.[0]?.b64_json;
     if (b64) return Buffer.from(b64, "base64");
     const url = r.data?.[0]?.url;
@@ -102,7 +105,7 @@ async function generateImage(prompt) {
       const r = await fetch("https://fal.run/" + model, {
         method: "POST",
         headers: { Authorization: "Key " + FLUX_API_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: p, image_size: "square_hd", num_inference_steps: 4 }),
+        body: JSON.stringify({ prompt: p, image_size: small ? "square" : "square_hd", num_inference_steps: 4 }),
       }).then((x) => x.json());
       const url = r.images?.[0]?.url;
       if (url) return Buffer.from(await (await fetch(url)).arrayBuffer());
@@ -199,6 +202,53 @@ async function uploadToRoblox(png, name) {
   return null;
 }
 
+function summarizeActions(actions) {
+  const parts = (actions || []).map((a) => {
+    if (!a || typeof a !== "object") return "algo";
+    if (a.type === "obby") return `un obby de ${a.stages || 4} etapas`;
+    if (a.type === "tycoon") return "un tycoon completo (dropper, cinta, ventas)";
+    if (a.type === "simulator") return `una base de simulador (${a.orbs || 20} orbes)`;
+    if (a.type === "clear") return "vaciar la parcela";
+    if (a.type === "undo") return "deshacer lo último";
+    if (a.type === "modify_last") return "ajustar lo último";
+    if (a.type === "spawn") {
+      const n = a.count && a.count > 1 ? `${a.count} ` : "";
+      return `${n}${a.color ? a.color + " " : ""}${a.shape || "objeto"}${a.count > 1 ? "s" : ""}`;
+    }
+    return String(a.type || "algo");
+  });
+  return parts.join("  ·  ");
+}
+
+// generate N reference images (different views) and upload them; returns [assetId,...]
+const REF_VIEWS = [
+  "front elevation, straight-on orthographic view",
+  "3/4 isometric angle view",
+  "top-down plan view from directly above",
+];
+async function makeReferenceImages(promptText, n) {
+  if (IMAGE_PROVIDER === "none" || !ROBLOX_OPEN_CLOUD_KEY || !ROBLOX_CREATOR_ID) return [];
+  const count = Math.max(1, Math.min(4, Number(n) || 3));
+  const base = String(promptText || "").slice(0, 220);
+  const jobs = [];
+  for (let i = 0; i < count; i++) {
+    jobs.push(
+      (async () => {
+        try {
+          const png = await generateImage(base + " — " + REF_VIEWS[i % REF_VIEWS.length]);
+          if (!png) return null;
+          const up = await uploadToRoblox(png, "ref" + (i + 1) + " " + base.slice(0, 24));
+          return up?.assetId || null;
+        } catch (e) {
+          console.error("ref image error:", e?.message || e);
+          return null;
+        }
+      })(),
+    );
+  }
+  return (await Promise.all(jobs)).filter(Boolean);
+}
+
 async function makePreview(promptText, actions) {
   if (!PREVIEW_ENABLED || IMAGE_PROVIDER === "none") return null;
   if (!ROBLOX_OPEN_CLOUD_KEY || !ROBLOX_CREATOR_ID) return null;
@@ -221,8 +271,13 @@ const HARD_RULES = [
   "reply is one short friendly sentence in the SAME LANGUAGE as the user.",
   "Action types: spawn, obby, modify_last, undo, clear.",
   "spawn.shape: cube|sphere|cylinder|wedge|floor|wall|pillar|tower|platform|kill|checkpoint|ramp",
-  "  plus MACRO shapes that expand into many parts: house|bridge|stairs|tree|fence|arch|dome|pyramid.",
-  "spawn fields: count (1-40), color, material, scale (usually 0.5-3), position.rel (front|back|left|right|up|center).",
+  "  plus MACRO shapes that expand into many parts: house|bridge|stairs|tree|fence|arch|dome|pyramid|castle|road|shop.",
+  "spawn fields: count (1-40), color, material (plastic|wood|metal|neon|glass|brick|grass|sand|ice|concrete|marble|slate|smoothplastic|asphalt|cobblestone),",
+  "scale (usually 0.5-3), rotation (deg around Y), layout (row|grid|circle|stack|line_z, for count>1), spacing (studs),",
+  "position: {rel, on, relativeTo, x, y, z}. rel: front|back|left|right|up|center|last|plot.",
+  "PLACEMENT RULES: rel:'last' puts it where the previous build is. rel:'right'/'left'/'front'/'back' with relativeTo:'last' puts it beside the previous build.",
+  "on:'last' stacks it on top of the previous build. rel:'plot' with x/z is absolute studs from the plot centre (plot is 230x230, y is up).",
+  "Compose scenes step by step: first the base (floor/road), then buildings relative to it, then details on top. Use grid/circle layouts for repeated items.",
   "shape 'kill' kills on touch. 'checkpoint' is a respawn flag. 'platform' is a small step.",
   "obby: {\"type\":\"obby\",\"stages\":2-10} = a FULL multi-stage jump course. For any obby/parkour/jump-course request use ONE obby action, never walls/towers.",
   "tycoon: {\"type\":\"tycoon\"} = a FULL working starter tycoon (dropper, conveyor, green SELL pad = Cash, upgrade pads).",
@@ -231,6 +286,27 @@ const HARD_RULES = [
   "modify_last fields: color, material, scale.",
   "Keep actions minimal (1-4). If unclear, return actions:[] and ask a short question. No prose outside the JSON.",
 ].join(" ");
+
+// Curated example library (prompt -> plan). Teaches the model what "good"
+// looks like in this vocabulary. Kept stable so it stays prompt-cacheable.
+const FEW_SHOT = [
+  "EXAMPLES (user -> JSON):",
+  '"an obby with 5 stages and kill bricks" -> {"reply":"¡Obby de 5 etapas!","actions":[{"type":"obby","stages":5}]}',
+  '"a hard parkour with 8 stages" -> {"reply":"Parkour de 8 etapas.","actions":[{"type":"obby","stages":8,"platforms_per_stage":6}]}',
+  '"make me a tycoon" -> {"reply":"Tycoon inicial listo.","actions":[{"type":"tycoon"}]}',
+  '"a pet simulator map with lots of orbs" -> {"reply":"Base de simulador.","actions":[{"type":"simulator","orbs":36}]}',
+  '"a wooden house with a garden" -> {"reply":"Casa con jardín.","actions":[{"type":"spawn","shape":"floor","color":"green","material":"grass","scale":1.4},{"type":"spawn","shape":"house","color":"brown","material":"wood","position":{"rel":"last"}},{"type":"spawn","shape":"tree","count":3,"layout":"row","spacing":6,"position":{"rel":"right","relativeTo":"last"}},{"type":"spawn","shape":"fence","count":10,"position":{"rel":"front","relativeTo":"last"}}]}',
+  '"a medieval castle on a hill" -> {"reply":"Castillo medieval.","actions":[{"type":"spawn","shape":"cylinder","color":"green","material":"grass","scale":6,"position":{"rel":"plot","x":0,"z":0}},{"type":"spawn","shape":"castle","material":"cobblestone","position":{"on":"last"}}]}',
+  '"a street with 4 houses and a shop" -> {"reply":"Calle con casas y tienda.","actions":[{"type":"spawn","shape":"road","count":120,"position":{"rel":"plot","x":0,"z":0}},{"type":"spawn","shape":"house","count":4,"layout":"line_z","spacing":10,"color":"white","position":{"rel":"plot","x":-26,"z":-40}},{"type":"spawn","shape":"shop","color":"orange","position":{"rel":"plot","x":26,"z":0}}]}',
+  '"a stone bridge over a lava river" -> {"reply":"Puente sobre lava.","actions":[{"type":"spawn","shape":"kill","scale":3,"layout":"line_z","count":3,"spacing":0,"position":{"rel":"plot","x":0,"z":0}},{"type":"spawn","shape":"bridge","material":"slate","position":{"rel":"last"}}]}',
+  '"a tall tower with stairs going up" -> {"reply":"Torre con escaleras.","actions":[{"type":"spawn","shape":"tower","color":"gray","material":"brick","scale":1.5},{"type":"spawn","shape":"stairs","count":12,"position":{"rel":"front","relativeTo":"last"}}]}',
+  '"an arena surrounded by pillars" -> {"reply":"Arena con columnas.","actions":[{"type":"spawn","shape":"cylinder","color":"sand","material":"sand","scale":8,"position":{"rel":"plot","x":0,"z":0}},{"type":"spawn","shape":"pillar","count":12,"layout":"circle","spacing":6,"color":"white","material":"marble","position":{"rel":"last"}}]}',
+  '"a 3x3 grid of neon platforms floating" -> {"reply":"Rejilla de plataformas.","actions":[{"type":"spawn","shape":"platform","count":9,"layout":"grid","spacing":6,"color":"cyan","material":"neon","position":{"rel":"plot","x":0,"y":12,"z":0}}]}',
+  '"stack 5 cubes into a totem" -> {"reply":"Tótem de 5 cubos.","actions":[{"type":"spawn","shape":"cube","count":5,"layout":"stack","color":"orange"}]}',
+  '"put a roof on it" -> {"reply":"Tejado puesto.","actions":[{"type":"spawn","shape":"wedge","color":"red","material":"slate","scale":2,"position":{"on":"last"}}]}',
+  '"make it bigger and blue" -> {"reply":"Más grande y azul.","actions":[{"type":"modify_last","scale":1.5,"color":"blue"}]}',
+  '"delete everything" -> {"reply":"Parcela vaciada.","actions":[{"type":"clear"}]}',
+].join("\n");
 
 function send(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -272,11 +348,42 @@ async function interpret(payload) {
     if (hint) extraSystem = (extraSystem ? extraSystem + "\n\n" : "") + hint;
   }
 
+  // Vision planning: generate a concept render first and let the model look
+  // at it while writing the plan. Works with just an image key; the Open Cloud
+  // upload (for showing it in-game) is optional.
+  let visionImage = null;
+  if (payload.vision && IMAGE_PROVIDER !== "none") {
+    try {
+      const png = await generateImage(userText.slice(0, 220) + " — 3/4 isometric angle view", true);
+      if (png) {
+        let assetId = null;
+        try {
+          const up = await uploadToRoblox(png, "concept " + userText.slice(0, 24));
+          assetId = up?.assetId || null;
+        } catch {}
+        visionImage = { b64: png.toString("base64"), assetId };
+      }
+    } catch (e) {
+      console.error("vision image error:", e?.message || e);
+    }
+  }
+
+  const textPart =
+    `Player context (JSON): ${ctx}\n\nPlayer request (respond with JSON): ${userText}` +
+    (visionImage
+      ? "\n\nA concept render of the requested scene is attached. Reproduce its layout, proportions and colours as closely as the primitives allow, composing it step by step with relative placement."
+      : "");
+
   const messages = [
-    { role: "system", content: HARD_RULES + (extraSystem ? "\n\n" + extraSystem : "") },
+    { role: "system", content: HARD_RULES + "\n\n" + FEW_SHOT + (extraSystem ? "\n\n" + extraSystem : "") },
     {
       role: "user",
-      content: `Player context (JSON): ${ctx}\n\nPlayer request (respond with JSON): ${userText}`,
+      content: visionImage
+        ? [
+            { type: "text", text: textPart },
+            { type: "image_url", image_url: { url: "data:image/png;base64," + visionImage.b64, detail: "low" } },
+          ]
+        : textPart,
     },
   ];
 
@@ -336,6 +443,7 @@ async function interpret(payload) {
     reply: typeof parsed.reply === "string" ? parsed.reply : "Listo.",
     actions: Array.isArray(parsed.actions) ? parsed.actions : [],
     tokens,
+    ...(visionImage?.assetId ? { images: [visionImage.assetId] } : {}),
   };
 }
 
@@ -379,6 +487,12 @@ const server = http.createServer((req, res) => {
     }
     const phase = payload.phase || "plan";
     try {
+      // reference images only (no LLM, no build) — game calls this after building
+      if (phase === "images") {
+        const images = await makeReferenceImages(payload.prompt, payload.views);
+        return send(res, 200, { images });
+      }
+
       // phase 2: the player pressed OK -> return the stashed plan, no LLM call
       if (phase === "confirm") {
         const actions = takePlan(payload.token);
@@ -391,20 +505,21 @@ const server = http.createServer((req, res) => {
       // plan the actions with the LLM
       const result = await interpret(payload);
 
-      // phase 1: try to produce a reference image + hold the plan for confirmation
+      // phase 1: hold the plan and show a confirm card (image if configured, else text)
       if (phase === "preview" && Array.isArray(result.actions) && result.actions.length > 0) {
-        const preview = await makePreview(payload.prompt, result.actions);
-        if (preview) {
-          return send(res, 200, {
-            reply: result.reply,
-            tokens: result.tokens,
-            preview: { assetId: preview.assetId, moderation: preview.moderation },
-            token: preview.token,
-          });
-        }
+        const img = await makePreview(payload.prompt, result.actions);
+        const token = img ? img.token : stashPlan(result.actions);
+        return send(res, 200, {
+          reply: result.reply,
+          tokens: result.tokens,
+          token,
+          preview: img
+            ? { assetId: img.assetId, moderation: img.moderation }
+            : { summary: summarizeActions(result.actions) },
+        });
       }
 
-      // no preview available -> just return the plan to build now
+      // phase "plan" -> just return the plan to build now
       send(res, 200, result);
     } catch (err) {
       console.error("interpret error:", err?.status || "", err?.message || err);
